@@ -2,7 +2,7 @@ import type { Api, Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import OpenAI from "openai";
-import type { WebSearchTool } from "openai/resources/responses/responses.js";
+import type { ResponseIncludable, WebSearchTool } from "openai/resources/responses/responses.js";
 
 type SupportedProvider = "openai" | "openai-codex";
 type SearchContextSize = "low" | "medium" | "high";
@@ -45,6 +45,32 @@ interface SearchClientConfig {
 	apiKey: string;
 	baseUrl: string;
 	headers?: Record<string, string>;
+}
+
+interface SearchResponseRecord {
+	id?: string;
+	output?: unknown[];
+	output_text?: string;
+}
+
+interface CodexSearchRequest {
+	model: string;
+	store: false;
+	stream: true;
+	instructions: string;
+	input: Array<{
+		role: "user";
+		content: Array<{
+			type: "input_text";
+			text: string;
+		}>;
+	}>;
+	tools: ExtendedWebSearchTool[];
+	tool_choice: "auto";
+	include: string[];
+	reasoning?: {
+		effort: "low" | "medium" | "high";
+	};
 }
 
 type ExtendedWebSearchTool = WebSearchTool & { external_web_access?: boolean };
@@ -158,25 +184,27 @@ function normalizeCodexBaseUrl(baseUrl: string): string {
 }
 
 function buildClient(config: SearchClientConfig): OpenAI {
-	if (config.provider === "openai-codex") {
-		const accountId = extractAccountId(config.apiKey);
-		return new OpenAI({
-			apiKey: config.apiKey,
-			baseURL: normalizeCodexBaseUrl(config.baseUrl),
-			defaultHeaders: {
-				...config.headers,
-				"chatgpt-account-id": accountId,
-				originator: "pi-web-search",
-				"OpenAI-Beta": "responses=experimental",
-			},
-		});
-	}
-
 	return new OpenAI({
 		apiKey: config.apiKey,
 		baseURL: config.baseUrl,
 		defaultHeaders: config.headers,
 	});
+}
+
+function getCodexResponseUrl(baseUrl: string): string {
+	return `${normalizeCodexBaseUrl(baseUrl)}/responses`;
+}
+
+function buildCodexHeaders(config: SearchClientConfig): HeadersInit {
+	return {
+		...config.headers,
+		Authorization: `Bearer ${config.apiKey}`,
+		"chatgpt-account-id": extractAccountId(config.apiKey),
+		originator: "pi",
+		"OpenAI-Beta": "responses=experimental",
+		accept: "text/event-stream",
+		"content-type": "application/json",
+	};
 }
 
 function formatSource(source: SearchSource, index: number): string {
@@ -253,18 +281,45 @@ function extractSources(response: { output?: unknown[] }): SearchSource[] {
 	return dedupeByUrl(sources);
 }
 
-function getResolvedModel(
-	ctx: ExtensionContext,
-	provider: SupportedProvider,
-	requestedModelId?: string,
-): Model<Api> | undefined {
-	if (requestedModelId) {
-		return ctx.modelRegistry.find(provider, requestedModelId);
+function extractResponseText(response: SearchResponseRecord): string {
+	if (typeof response.output_text === "string" && response.output_text.trim()) {
+		return response.output_text.trim();
 	}
+
+	for (const item of response.output ?? []) {
+		if (!isRecord(item) || item.type !== "message" || !Array.isArray(item.content)) {
+			continue;
+		}
+		for (const block of item.content) {
+			if (!isRecord(block) || block.type !== "output_text" || typeof block.text !== "string") {
+				continue;
+			}
+			const text = block.text.trim();
+			if (text) {
+				return text;
+			}
+		}
+	}
+
+	return "";
+}
+
+function getResolvedModel(ctx: ExtensionContext, provider: SupportedProvider, requestedModelId?: string): Model<Api> | undefined {
+	const availableModels = ctx.modelRegistry.getAvailable().filter((model): model is Model<Api> => model.provider === provider);
+
+	if (requestedModelId) {
+		return availableModels.find((model) => model.id === requestedModelId) ?? ctx.modelRegistry.find(provider, requestedModelId);
+	}
+
 	if (ctx.model?.provider === provider) {
 		return ctx.model;
 	}
-	return ctx.modelRegistry.find(provider, DEFAULT_MODEL_BY_PROVIDER[provider]);
+
+	return (
+		availableModels.find((model) => model.id === DEFAULT_MODEL_BY_PROVIDER[provider]) ??
+		ctx.modelRegistry.find(provider, DEFAULT_MODEL_BY_PROVIDER[provider]) ??
+		availableModels[0]
+	);
 }
 
 async function resolveSearchClientConfig(ctx: ExtensionContext): Promise<SearchClientConfig> {
@@ -331,51 +386,144 @@ function buildUserLocation(params: WebSearchParameters):
 	};
 }
 
-function getDefaultReasoningEffort(): ReasoningEffort {
+function getConfiguredReasoningEffort(): ReasoningEffort | undefined {
 	const envValue = getEnv("PI_WEB_SEARCH_REASONING_EFFORT");
 	if (envValue === "minimal" || envValue === "low" || envValue === "medium" || envValue === "high") {
 		return envValue;
 	}
-	return "low";
+	return undefined;
 }
 
-function buildSearchPrompt(query: string): string {
-	return [
-		"Answer the user's request using web search.",
-		"Return a concise, factual answer with inline citations when available.",
-		"If the answer is uncertain, say so.",
-		`User request: ${query}`,
-	].join("\n");
+function supportsReasoning(modelId: string): boolean {
+	return /^(gpt-5|o1|o3|o4)(?:$|[-.])/.test(modelId);
+}
+
+function buildReasoning(modelId: string, effort: ReasoningEffort | undefined): { effort: "low" | "medium" | "high" } | undefined {
+	const normalizedEffort = normalizeReasoningEffort(effort);
+	if (!normalizedEffort || !supportsReasoning(modelId)) {
+		return undefined;
+	}
+	return { effort: normalizedEffort };
+}
+
+function buildCodexInstructions(): string {
+	return "Use web search to answer the request. Return a concise answer with citations when available.";
+}
+
+function parseCodexSSE(responseText: string): SearchResponseRecord {
+	let lastResponse: SearchResponseRecord | undefined;
+
+	for (const chunk of responseText.split("\n\n")) {
+		const dataLines = chunk
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map((line) => line.slice(5).trim())
+			.filter(Boolean);
+
+		if (dataLines.length === 0) {
+			continue;
+		}
+
+		const data = dataLines.join("\n");
+		if (data === "[DONE]") {
+			continue;
+		}
+
+		const event = JSON.parse(data) as RecordValue;
+		if (event.type === "error") {
+			const message = typeof event.message === "string" ? event.message : JSON.stringify(event);
+			throw new Error(message);
+		}
+
+		const response = isRecord(event.response) ? (event.response as SearchResponseRecord) : undefined;
+		if (!response) {
+			continue;
+		}
+
+		lastResponse = response;
+		if (event.type === "response.completed" || event.type === "response.incomplete") {
+			return response;
+		}
+	}
+
+	if (lastResponse) {
+		return lastResponse;
+	}
+
+	throw new Error("OpenAI Codex web search returned no response payload.");
+}
+
+async function executeCodexSearch(
+	config: SearchClientConfig,
+	query: string,
+	tools: ExtendedWebSearchTool[],
+	include: string[],
+	reasoning: { effort: "low" | "medium" | "high" } | undefined,
+	signal?: AbortSignal,
+): Promise<SearchResponseRecord> {
+	const body: CodexSearchRequest = {
+		model: config.modelId,
+		store: false,
+		stream: true,
+		instructions: buildCodexInstructions(),
+		input: [
+			{
+				role: "user",
+				content: [{ type: "input_text", text: query }],
+			},
+		],
+		tools,
+		tool_choice: "auto",
+		include,
+		reasoning,
+	};
+
+	const response = await fetch(getCodexResponseUrl(config.baseUrl), {
+		method: "POST",
+		headers: buildCodexHeaders(config),
+		body: JSON.stringify(body),
+		signal,
+	});
+
+	const responseText = await response.text();
+	if (!response.ok) {
+		throw new Error(`OpenAI Codex web search failed (${response.status}): ${responseText || response.statusText}`);
+	}
+
+	return parseCodexSSE(responseText);
 }
 
 async function executeWebSearch(params: WebSearchParameters, ctx: ExtensionContext, signal?: AbortSignal) {
 	const config = await resolveSearchClientConfig(ctx);
-	const client = buildClient(config);
 	const allowedDomains = normalizeDomains(params.allowedDomains);
 	const userLocation = buildUserLocation(params);
-	const reasoningEffort = normalizeReasoningEffort(params.reasoningEffort ?? getDefaultReasoningEffort());
+	const reasoning = buildReasoning(config.modelId, params.reasoningEffort ?? getConfiguredReasoningEffort());
 	const webSearchTool: ExtendedWebSearchTool = {
 		type: "web_search",
 		filters: allowedDomains ? { allowed_domains: allowedDomains } : undefined,
 		search_context_size: params.searchContextSize,
 		user_location: userLocation,
-		external_web_access: params.externalWebAccess ?? true,
+		external_web_access: params.externalWebAccess,
 	};
+	const include: ResponseIncludable[] = ["web_search_call.action.sources"];
 
-	const response = await client.responses.create(
-		{
-			model: config.modelId,
-			input: buildSearchPrompt(params.query),
-			tool_choice: "required",
-			include: ["web_search_call.action.sources"],
-			tools: [webSearchTool],
-			reasoning: reasoningEffort ? { effort: reasoningEffort } : undefined,
-		},
-		signal ? { signal } : undefined,
-	);
+	const responseRecord =
+		config.provider === "openai-codex"
+			? await executeCodexSearch(config, params.query, [webSearchTool], include, reasoning, signal)
+			: ((await buildClient(config).responses.create(
+					{
+						model: config.modelId,
+						input: params.query,
+						tool_choice: "auto",
+						include,
+						store: false,
+						tools: [webSearchTool],
+						reasoning,
+					},
+					signal ? { signal } : undefined,
+				)) as SearchResponseRecord);
 
-	const responseRecord = response as unknown as { id?: string; output?: unknown[]; output_text?: string };
-	const answer = response.output_text?.trim() || "";
+	const answer = extractResponseText(responseRecord);
 	const citations = extractCitations(responseRecord);
 	const sources = extractSources(responseRecord);
 
@@ -404,13 +552,12 @@ function createWebSearchTool(): ToolDefinition<typeof WebSearchParametersSchema,
 	return {
 		name: "web_search",
 		label: "Web Search",
-		description: "Search the web with OpenAI web search and return a cited answer with sources.",
-		promptSnippet:
-			"web_search(query, ...): search the web for current information, optionally narrowing by domain, location, context size, or live-vs-cached mode.",
+		description: "Search the web with OpenAI and return a cited answer with sources.",
+		promptSnippet: "web_search(query, ...): search the web when the answer needs current or external information.",
 		promptGuidelines: [
 			"Use `web_search` for current events, live facts, rapidly changing information, or when the user explicitly asks for web sources.",
 			"Use `allowedDomains` when the user asks for official docs, vendor pages, or a narrow source set.",
-			"Set `externalWebAccess: false` when cached/indexed results are sufficient or live access is undesirable.",
+			"Set `externalWebAccess: false` when cached/indexed results are enough.",
 		],
 		parameters: WebSearchParametersSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

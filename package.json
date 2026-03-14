@@ -28,12 +28,17 @@
 	],
 	"license": "MIT",
 	"dependencies": {
+		"openai": "6.26.0"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-ai": "*",
+		"@mariozechner/pi-coding-agent": "*",
+		"@sinclair/typebox": "*"
+	},
+	"devDependencies": {
 		"@mariozechner/pi-ai": "^0.58.1",
 		"@mariozechner/pi-coding-agent": "^0.58.1",
 		"@sinclair/typebox": "^0.34.41",
-		"openai": "6.26.0"
-	},
-	"devDependencies": {
 		"@types/node": "^24.3.0",
 		"typescript": "^5.9.2"
 	}

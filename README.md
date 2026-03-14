@@ -1,6 +1,6 @@
 # pi-web-search
 
-Standalone pi extension package that adds a `web_search` tool powered by OpenAI's built-in Responses API web search.
+Standalone pi package that adds a small `web_search` tool backed by OpenAI's built-in Responses API web search.
 
 ## Install
 
@@ -17,7 +17,7 @@ The extension works with either:
 - `openai-codex` auth from pi `/login`
 - `OPENAI_API_KEY`
 
-It prefers the current model when that model uses `openai` or `openai-codex`, then falls back to `openai-codex`, then `openai`.
+It prefers the current model when that model uses `openai` or `openai-codex`, then falls back to the first authenticated OpenAI provider it can use.
 
 ## What it adds
 
@@ -41,7 +41,7 @@ Parameters:
 - `allowedDomains?`: optional domain allow-list like `openai.com`
 - `searchContextSize?`: `low`, `medium`, `high`
 - `externalWebAccess?`: `true` for live fetches, `false` for cache-only mode
-- `reasoningEffort?`: `minimal`, `low`, `medium`, `high`
+- `reasoningEffort?`: optional reasoning effort for reasoning-capable models
 - `country?`, `city?`, `region?`, `timezone?`: optional approximate user location hints
 
 Example prompt inside pi:
@@ -60,18 +60,19 @@ The tool returns:
 
 - `PI_WEB_SEARCH_PROVIDER`: `current`, `openai`, or `openai-codex`
 - `PI_WEB_SEARCH_MODEL`: override the search model
-- `PI_WEB_SEARCH_REASONING_EFFORT`: default effort when omitted in tool args
+- `PI_WEB_SEARCH_REASONING_EFFORT`: optional default effort when you want reasoning-capable models to search more deeply
 
 Defaults:
 
 - provider: current OpenAI/OpenAI Codex model, else `openai-codex`, else `openai`
-- model: current model if it matches, else `gpt-5.4`
-- reasoning effort: `low`
+- model: current model if it matches, else the provider default or first authenticated model
 
 ## Notes
 
 - The extension uses OpenAI's native web search tool, not a third-party crawler.
 - `externalWebAccess: false` requests cache-only behavior.
+- The tool sends the user's query directly to the model and keeps request shaping minimal.
+- Implementation notes: `docs/web-search-implementation.md`
 - The package is designed for git-based installation through pi.
 
 ## Development
