@@ -1,0 +1,40 @@
+{
+	"name": "pi-web-search",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Standalone pi extension that adds OpenAI-backed web search",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/saugatkhadka/pi-web-search"
+	},
+	"homepage": "https://github.com/saugatkhadka/pi-web-search",
+	"bugs": {
+		"url": "https://github.com/saugatkhadka/pi-web-search/issues"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"check": "tsc --noEmit -p tsconfig.json"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"web-search",
+		"openai",
+		"codex"
+	],
+	"license": "MIT",
+	"dependencies": {
+		"@mariozechner/pi-ai": "^0.58.1",
+		"@mariozechner/pi-coding-agent": "^0.58.1",
+		"@sinclair/typebox": "^0.34.41",
+		"openai": "6.26.0"
+	},
+	"devDependencies": {
+		"@types/node": "^24.3.0",
+		"typescript": "^5.9.2"
+	}
+}
